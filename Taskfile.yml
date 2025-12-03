@@ -8,10 +8,90 @@ vars:
   SECRETS_DIR: secrets
   ENCRYPTED_DIR: encrypted
   BAO_ADDR: http://127.0.0.1:8200
+  ROOT_CA_CONFIG_FILE: config/root-ca.json
   # Root CA configuration
   ROOT_CA_TTL: "87600h"  # 10 years
-  ROOT_CA_CN: "Ephemeral Root CA"
-  ROOT_CA_ORG: "Ephemeral PKI"
+  ROOT_CA_CN:
+    sh: |
+      if [ -f "{{.ROOT_CA_CONFIG_FILE}}" ]; then
+        jq -r '.name // "Ephemeral Root CA"' "{{.ROOT_CA_CONFIG_FILE}}"
+      else
+        echo "Ephemeral Root CA"
+      fi
+  ROOT_CA_ORG:
+    sh: |
+      if [ -f "{{.ROOT_CA_CONFIG_FILE}}" ]; then
+        jq -r '.organization // "Ephemeral PKI"' "{{.ROOT_CA_CONFIG_FILE}}"
+      else
+        echo "Ephemeral PKI"
+      fi
+  ROOT_CA_BASE_URL:
+    sh: |
+      if [ -f "{{.ROOT_CA_CONFIG_FILE}}" ]; then
+        DOMAIN=$(jq -r '.domain // ""' "{{.ROOT_CA_CONFIG_FILE}}")
+        if [ -n "$DOMAIN" ] && [ "$DOMAIN" != "null" ]; then
+          case "$DOMAIN" in
+            http://*|https://*) printf "%s" "$DOMAIN" ;;
+            *) printf "https://%s" "$DOMAIN" ;;
+          esac
+          exit 0
+        fi
+      fi
+      printf "%s" "{{.BAO_ADDR}}"
+  SUB_CA_CONFIG_FILE: config/sub-ca.json
+  SUB_CA_MOUNT:
+    sh: |
+      if [ -f "{{.SUB_CA_CONFIG_FILE}}" ]; then
+        VALUE=$(jq -r '.mount // ""' "{{.SUB_CA_CONFIG_FILE}}")
+        if [ -n "$VALUE" ] && [ "$VALUE" != "null" ]; then
+          printf "%s" "$VALUE"
+          exit 0
+        fi
+      fi
+      printf "%s" "pki_int"
+  SUB_CA_TTL:
+    sh: |
+      if [ -f "{{.SUB_CA_CONFIG_FILE}}" ]; then
+        VALUE=$(jq -r '.ttl // ""' "{{.SUB_CA_CONFIG_FILE}}")
+        if [ -n "$VALUE" ] && [ "$VALUE" != "null" ]; then
+          printf "%s" "$VALUE"
+          exit 0
+        fi
+      fi
+      printf "%s" "43800h"
+  SUB_CA_CN:
+    sh: |
+      if [ -f "{{.SUB_CA_CONFIG_FILE}}" ]; then
+        jq -r '.name // "Ephemeral Issuing CA"' "{{.SUB_CA_CONFIG_FILE}}"
+      else
+        echo "Ephemeral Issuing CA"
+      fi
+  SUB_CA_ORG:
+    sh: |
+      if [ -f "{{.SUB_CA_CONFIG_FILE}}" ]; then
+        VALUE=$(jq -r '.organization // ""' "{{.SUB_CA_CONFIG_FILE}}")
+        if [ -n "$VALUE" ] && [ "$VALUE" != "null" ]; then
+          printf "%s" "$VALUE"
+          exit 0
+        fi
+      fi
+      printf "%s" "Ephemeral PKI"
+  SUB_CA_BASE_URL:
+    sh: |
+      if [ -f "{{.SUB_CA_CONFIG_FILE}}" ]; then
+        DOMAIN=$(jq -r '.domain // ""' "{{.SUB_CA_CONFIG_FILE}}")
+        if [ -n "$DOMAIN" ] && [ "$DOMAIN" != "null" ]; then
+          case "$DOMAIN" in
+            http://*|https://*) printf "%s" "$DOMAIN" ;;
+            *) printf "https://%s" "$DOMAIN" ;;
+          esac
+          exit 0
+        fi
+      fi
+      printf "%s" "{{.BAO_ADDR}}"
+  SUB_CA_CERT_FILE: "{{.SECRETS_DIR}}/sub-ca.pem"
+  SUB_CA_CERT_BASENAME:
+    sh: basename "{{.SUB_CA_CERT_FILE}}"
 
 env:
   BAO_ADDR: "{{.BAO_ADDR}}"
@@ -227,13 +307,128 @@ tasks:
           -H "X-Vault-Token: $ROOT_TOKEN" \
           -H "Content-Type: application/json" \
           -d '{
-            "issuing_certificates": "{{.BAO_ADDR}}/v1/pki/ca",
-            "crl_distribution_points": "{{.BAO_ADDR}}/v1/pki/crl"
+            "issuing_certificates": "{{.ROOT_CA_BASE_URL}}/v1/pki/ca",
+            "crl_distribution_points": "{{.ROOT_CA_BASE_URL}}/v1/pki/crl"
           }' > /dev/null
         
         echo "Root CA certificate generated and saved to {{.SECRETS_DIR}}/root-ca.pem"
         echo "Certificate details:"
         openssl x509 -in "{{.SECRETS_DIR}}/root-ca.pem" -text -noout | head -20
+
+  generate-sub-ca:
+    desc: Generate subordinate/issuing CA signed by the root CA
+    cmds:
+      - task: unseal
+      - |
+        if [ ! -f "{{.SUB_CA_CONFIG_FILE}}" ]; then
+          echo "Configuration not found at {{.SUB_CA_CONFIG_FILE}}"
+          exit 1
+        fi
+
+        if [ ! -f "{{.SECRETS_DIR}}/init.json" ]; then
+          echo "No init.json found. Run 'task setup-root-ca' first."
+          exit 1
+        fi
+
+        ROOT_TOKEN=$(jq -r '.root_token' "{{.SECRETS_DIR}}/init.json")
+        if [ -z "$ROOT_TOKEN" ] || [ "$ROOT_TOKEN" = "null" ]; then
+          echo "Failed to retrieve root token from {{.SECRETS_DIR}}/init.json"
+          exit 1
+        fi
+
+        MOUNT="{{.SUB_CA_MOUNT}}"
+        echo "Using PKI mount: $MOUNT"
+
+        MOUNTS=$(curl -s "{{.BAO_ADDR}}/v1/sys/mounts" -H "X-Vault-Token: $ROOT_TOKEN")
+        if echo "$MOUNTS" | jq -e --arg path "$MOUNT/" '.[$path]' > /dev/null 2>&1; then
+          echo "PKI secrets engine at $MOUNT already enabled"
+        else
+          echo "Enabling PKI secrets engine at $MOUNT..."
+          curl -s -X POST "{{.BAO_ADDR}}/v1/sys/mounts/$MOUNT" \
+            -H "X-Vault-Token: $ROOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"type":"pki"}' > /dev/null
+        fi
+
+        echo "Tuning $MOUNT to max TTL {{.SUB_CA_TTL}}..."
+        curl -s -X POST "{{.BAO_ADDR}}/v1/sys/mounts/$MOUNT/tune" \
+          -H "X-Vault-Token: $ROOT_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n --arg ttl "{{.SUB_CA_TTL}}" '{max_lease_ttl: $ttl}')" > /dev/null
+
+        echo "Generating intermediate CSR..."
+        CSR_RESPONSE=$(curl -s -X POST "{{.BAO_ADDR}}/v1/$MOUNT/intermediate/generate/internal" \
+          -H "X-Vault-Token: $ROOT_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n \
+            --arg cn "{{.SUB_CA_CN}}" \
+            --arg org "{{.SUB_CA_ORG}}" \
+            --arg ttl "{{.SUB_CA_TTL}}" \
+            --arg key_type "ec" \
+            --argjson key_bits 384 \
+            '{common_name: $cn, ttl: $ttl, key_type: $key_type, key_bits: $key_bits} + (if $org == "" then {} else {organization: $org} end)')")
+
+        CSR=$(echo "$CSR_RESPONSE" | jq -r '.data.csr // empty')
+        if [ -z "$CSR" ]; then
+          echo "Failed to generate intermediate CSR:"
+          echo "$CSR_RESPONSE" | jq .
+          exit 1
+        fi
+
+        echo "Signing intermediate with root CA..."
+        SIGN_RESPONSE=$(curl -s -X POST "{{.BAO_ADDR}}/v1/pki/root/sign-intermediate" \
+          -H "X-Vault-Token: $ROOT_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n \
+            --arg csr "$CSR" \
+            --arg ttl "{{.SUB_CA_TTL}}" \
+            --arg format "pem_bundle" \
+            '{csr: $csr, ttl: $ttl, format: $format}')")
+
+        if echo "$SIGN_RESPONSE" | jq -e '.errors' > /dev/null 2>&1; then
+          echo "Error signing intermediate:"
+          echo "$SIGN_RESPONSE" | jq '.errors'
+          exit 1
+        fi
+
+        CERT=$(echo "$SIGN_RESPONSE" | jq -r '.data.certificate // empty')
+        if [ -z "$CERT" ]; then
+          echo "No signed certificate returned."
+          echo "$SIGN_RESPONSE" | jq .
+          exit 1
+        fi
+
+        echo "Publishing signed certificate to $MOUNT..."
+        curl -s -X POST "{{.BAO_ADDR}}/v1/$MOUNT/intermediate/set-signed" \
+          -H "X-Vault-Token: $ROOT_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n --arg cert "$CERT" '{certificate: $cert}')" > /dev/null
+
+        mkdir -p "{{.SECRETS_DIR}}"
+        CHAIN_OUTPUT=$(echo "$SIGN_RESPONSE" | jq -r '.data.ca_chain // [] | .[]')
+        {
+          printf '%s\n' "$CERT"
+          if [ -n "$CHAIN_OUTPUT" ]; then
+            printf '%s\n' "$CHAIN_OUTPUT"
+          fi
+        } > "{{.SUB_CA_CERT_FILE}}"
+
+        if command -v openssl > /dev/null 2>&1; then
+          echo "Subordinate certificate summary:"
+          openssl x509 -in "{{.SUB_CA_CERT_FILE}}" -text -noout | head -20
+        fi
+
+        echo "Configuring issuing and CRL URLs..."
+        curl -s -X POST "{{.BAO_ADDR}}/v1/$MOUNT/config/urls" \
+          -H "X-Vault-Token: $ROOT_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n \
+            --arg issuing "{{.SUB_CA_BASE_URL}}/v1/$MOUNT/ca" \
+            --arg crl "{{.SUB_CA_BASE_URL}}/v1/$MOUNT/crl" \
+            '{issuing_certificates: $issuing, crl_distribution_points: $crl}')" > /dev/null
+
+        echo "Subordinate CA certificate saved to {{.SUB_CA_CERT_FILE}}"
+        echo "Subordinate CA setup complete."
 
   sign-intermediate:
     desc: Sign an intermediate CA CSR
@@ -309,7 +504,7 @@ tasks:
           exit 1
         fi
         
-        AGE_RECIPIENT=$(grep -oP 'public key: \K.*' "{{.AGE_KEY_FILE}}")
+        AGE_RECIPIENT=$(grep 'public key:' "{{.AGE_KEY_FILE}}" | sed 's/.*public key: //')
         mkdir -p "{{.ENCRYPTED_DIR}}"
         
         # Encrypt init.json if it exists
@@ -328,6 +523,12 @@ tasks:
         if [ -f "{{.SECRETS_DIR}}/crl.pem" ]; then
           age -r "$AGE_RECIPIENT" -o "{{.ENCRYPTED_DIR}}/crl.pem.age" "{{.SECRETS_DIR}}/crl.pem"
           echo "Encrypted crl.pem"
+        fi
+
+        if [ -f "{{.SUB_CA_CERT_FILE}}" ]; then
+          BASENAME="{{.SUB_CA_CERT_BASENAME}}"
+          age -r "$AGE_RECIPIENT" -o "{{.ENCRYPTED_DIR}}/${BASENAME}.age" "{{.SUB_CA_CERT_FILE}}"
+          echo "Encrypted $BASENAME"
         fi
         
         echo "All secrets encrypted to {{.ENCRYPTED_DIR}}/"
@@ -360,6 +561,12 @@ tasks:
         if [ -f "{{.ENCRYPTED_DIR}}/crl.pem.age" ]; then
           age -d -i "{{.AGE_KEY_FILE}}" -o "{{.SECRETS_DIR}}/crl.pem" "{{.ENCRYPTED_DIR}}/crl.pem.age"
           echo "Decrypted crl.pem"
+        fi
+
+        BASENAME="{{.SUB_CA_CERT_BASENAME}}"
+        if [ -f "{{.ENCRYPTED_DIR}}/${BASENAME}.age" ]; then
+          age -d -i "{{.AGE_KEY_FILE}}" -o "{{.SUB_CA_CERT_FILE}}" "{{.ENCRYPTED_DIR}}/${BASENAME}.age"
+          echo "Decrypted $BASENAME"
         fi
         
         echo "Secrets decrypted to {{.SECRETS_DIR}}/"

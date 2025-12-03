@@ -1,0 +1,7 @@
+{
+  "name": "Issuing CA",
+  "organization": "Internal Issuing",
+  "domain": "internal.example.com",
+  "ttl": "43800h",
+  "mount": "pki_int"
+}

@@ -1,6 +1,6 @@
 # ephemeral-root-ca
 
-An on-demand root certificate authority using OpenBao and self-sealed with local age encryption.
+An on-demand root certificate authority using OpenBao and self-sealed with local age encryption. This brings up the vault instance via docker, unseals and configures the root ca with local files that are then age encrypted before being commit into git. The only thing required to bring things back online to rotate/sign certs is the original age private key (`age.key`) and a container engine.
 
 ## Overview
 
@@ -43,6 +43,8 @@ task init
 # Start OpenBao container
 docker compose up -d
 
+task initialize
+
 # Wait for OpenBao to be ready, then set up the Root CA
 task setup-root-ca
 ```
@@ -70,6 +72,7 @@ task stop
 | `task start` | Decrypt secrets and start OpenBao |
 | `task stop` | Seal OpenBao and encrypt all secrets |
 | `task setup-root-ca` | Initialize OpenBao and generate root CA |
+| `task generate-sub-ca` | Provision a subordinate/issuing CA from `config/sub-ca.json` |
 | `task sign-intermediate CSR_FILE=<path>` | Sign an intermediate CA CSR |
 | `task update-crl` | Update the Certificate Revocation List |
 | `task status` | Show OpenBao status |
@@ -130,13 +133,38 @@ After the initial setup, you can:
 ## Configuration
 
 ### Root CA Settings
-Edit the `vars` section in `Taskfile.yml`:
-```yaml
-vars:
-  ROOT_CA_TTL: "87600h"  # 10 years
-  ROOT_CA_CN: "Ephemeral Root CA"
-  ROOT_CA_ORG: "Ephemeral PKI"
+Edit `config/root-ca.json` to declare the Root CA metadata:
+```json
+{
+  "name": "Ephemeral Root CA",
+  "organization": "Ephemeral PKI",
+  "domain": "pki.example.com"
+}
 ```
+
+- `name` sets the Root CA common name used during generation.
+- `organization` is optional and defaults to `Ephemeral PKI` when omitted.
+- `domain` is optional; when provided it is used to build the issuing and CRL URLs. Supply either a hostname (scheme defaults to `https://`) or a full URL. When left empty the local `BAO_ADDR` value is used instead.
+
+### Subordinate CA Settings
+Edit `config/sub-ca.json` to describe the issuing CA that will be signed by the root:
+```json
+{
+  "name": "Ephemeral Issuing CA",
+  "organization": "Ephemeral PKI Issuing",
+  "domain": "int-ca.example.com",
+  "ttl": "43800h",
+  "mount": "pki_int"
+}
+```
+
+- `name` is the subordinate CA common name encoded into the certificate.
+- `organization` is optional; leave blank or remove to skip setting it.
+- `domain` works like the root CA domain and drives the issuing/CRL URLs for the subordinate mount.
+- `ttl` controls both the generated key lifetime and the signed certificate TTL (defaults to `43800h` ≈ 5 years).
+- `mount` specifies the OpenBao mount where the subordinate PKI engine lives (defaults to `pki_int`).
+
+Once configured, run `task generate-sub-ca` (with OpenBao unsealed) to provision or refresh the issuing CA. The signed certificate is stored at `secrets/sub-ca.pem` and will be encrypted alongside the other secrets when you run `task stop` or `task encrypt-secrets`.
 
 ### OpenBao Settings
 Edit `config/openbao.hcl` for OpenBao server configuration.

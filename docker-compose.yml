@@ -1,6 +1,6 @@
 services:
   openbao:
-    image: quay.io/openbao/openbao:2.1.0
+    image: quay.io/openbao/openbao:2.4.4
     container_name: ephemeral-root-ca
     cap_add:
       - IPC_LOCK

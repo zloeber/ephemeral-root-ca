@@ -1,0 +1,382 @@
+# Ephemeral Root CA Taskfile
+# https://taskfile.dev
+
+version: '3'
+
+vars:
+  AGE_KEY_FILE: age.key
+  SECRETS_DIR: secrets
+  ENCRYPTED_DIR: encrypted
+  BAO_ADDR: http://127.0.0.1:8200
+  # Root CA configuration
+  ROOT_CA_TTL: "87600h"  # 10 years
+  ROOT_CA_CN: "Ephemeral Root CA"
+  ROOT_CA_ORG: "Ephemeral PKI"
+
+env:
+  BAO_ADDR: "{{.BAO_ADDR}}"
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  init:
+    desc: Generate age encryption key
+    cmds:
+      - |
+        if [ -f "{{.AGE_KEY_FILE}}" ]; then
+          echo "Age key already exists at {{.AGE_KEY_FILE}}"
+          echo "Delete it first if you want to regenerate"
+          exit 1
+        fi
+        age-keygen -o "{{.AGE_KEY_FILE}}"
+        chmod 600 "{{.AGE_KEY_FILE}}"
+        echo "Age key generated at {{.AGE_KEY_FILE}}"
+        echo "⚠️  IMPORTANT: Back up this key securely! It is required to decrypt secrets."
+        echo "⚠️  This file is gitignored and should NEVER be committed."
+    status:
+      - test -f "{{.AGE_KEY_FILE}}"
+
+  start:
+    desc: Decrypt secrets and start OpenBao
+    deps: [decrypt-secrets]
+    cmds:
+      - docker compose up -d
+      - echo "Waiting for OpenBao to be ready..."
+      - |
+        for i in $(seq 1 30); do
+          if curl -s "{{.BAO_ADDR}}/v1/sys/health" > /dev/null 2>&1; then
+            echo "OpenBao is ready"
+            break
+          fi
+          echo "Waiting... ($i/30)"
+          sleep 1
+        done
+      - task: unseal
+    preconditions:
+      - sh: test -f "{{.AGE_KEY_FILE}}"
+        msg: "Age key not found. Run 'task init' first."
+
+  stop:
+    desc: Seal OpenBao and encrypt all secrets
+    cmds:
+      - task: seal
+      - task: encrypt-secrets
+      - docker compose down
+      - echo "OpenBao stopped and secrets encrypted"
+
+  setup-root-ca:
+    desc: Initialize OpenBao and setup root CA
+    cmds:
+      - task: initialize
+      - task: unseal
+      - task: enable-pki
+      - task: generate-root-ca
+      - echo "Root CA setup complete!"
+
+  # Internal tasks for setup-root-ca
+  initialize:
+    desc: Initialize OpenBao (creates unseal keys and root token)
+    internal: false
+    cmds:
+      - |
+        mkdir -p "{{.SECRETS_DIR}}"
+        
+        # Check if already initialized
+        STATUS=$(curl -s "{{.BAO_ADDR}}/v1/sys/health" || echo '{"initialized":false}')
+        INITIALIZED=$(echo "$STATUS" | jq -r '.initialized // false')
+        
+        if [ "$INITIALIZED" = "true" ]; then
+          echo "OpenBao is already initialized"
+          exit 0
+        fi
+        
+        echo "Initializing OpenBao..."
+        INIT_RESPONSE=$(curl -s -X PUT "{{.BAO_ADDR}}/v1/sys/init" \
+          -H "Content-Type: application/json" \
+          -d '{"secret_shares": 1, "secret_threshold": 1}')
+        
+        echo "$INIT_RESPONSE" > "{{.SECRETS_DIR}}/init.json"
+        chmod 600 "{{.SECRETS_DIR}}/init.json"
+        
+        echo "OpenBao initialized. Unseal key and root token saved to {{.SECRETS_DIR}}/init.json"
+    status:
+      - test -f "{{.SECRETS_DIR}}/init.json"
+
+  unseal:
+    desc: Unseal OpenBao
+    internal: false
+    cmds:
+      - |
+        # Check if sealed
+        STATUS=$(curl -s "{{.BAO_ADDR}}/v1/sys/health" || echo '{"sealed":true}')
+        SEALED=$(echo "$STATUS" | jq -r '.sealed // true')
+        
+        if [ "$SEALED" = "false" ]; then
+          echo "OpenBao is already unsealed"
+          exit 0
+        fi
+        
+        if [ ! -f "{{.SECRETS_DIR}}/init.json" ]; then
+          echo "No init.json found. OpenBao may not be initialized."
+          exit 1
+        fi
+        
+        UNSEAL_KEY=$(jq -r '.keys[0]' "{{.SECRETS_DIR}}/init.json")
+        
+        echo "Unsealing OpenBao..."
+        curl -s -X PUT "{{.BAO_ADDR}}/v1/sys/unseal" \
+          -H "Content-Type: application/json" \
+          -d "{\"key\": \"$UNSEAL_KEY\"}" > /dev/null
+        
+        echo "OpenBao unsealed"
+
+  seal:
+    desc: Seal OpenBao
+    internal: false
+    cmds:
+      - |
+        # Check if already sealed
+        STATUS=$(curl -s "{{.BAO_ADDR}}/v1/sys/health" || echo '{"sealed":true}')
+        SEALED=$(echo "$STATUS" | jq -r '.sealed // true')
+        
+        if [ "$SEALED" = "true" ]; then
+          echo "OpenBao is already sealed"
+          exit 0
+        fi
+        
+        if [ ! -f "{{.SECRETS_DIR}}/init.json" ]; then
+          echo "No init.json found"
+          exit 1
+        fi
+        
+        ROOT_TOKEN=$(jq -r '.root_token' "{{.SECRETS_DIR}}/init.json")
+        
+        echo "Sealing OpenBao..."
+        curl -s -X PUT "{{.BAO_ADDR}}/v1/sys/seal" \
+          -H "X-Vault-Token: $ROOT_TOKEN" > /dev/null
+        
+        echo "OpenBao sealed"
+
+  enable-pki:
+    desc: Enable PKI secrets engine
+    internal: false
+    cmds:
+      - |
+        if [ ! -f "{{.SECRETS_DIR}}/init.json" ]; then
+          echo "No init.json found. Run 'task initialize' first."
+          exit 1
+        fi
+        
+        ROOT_TOKEN=$(jq -r '.root_token' "{{.SECRETS_DIR}}/init.json")
+        
+        # Check if PKI is already enabled
+        MOUNTS=$(curl -s "{{.BAO_ADDR}}/v1/sys/mounts" \
+          -H "X-Vault-Token: $ROOT_TOKEN")
+        
+        if echo "$MOUNTS" | jq -e '.["pki/"]' > /dev/null 2>&1; then
+          echo "PKI secrets engine already enabled"
+          exit 0
+        fi
+        
+        echo "Enabling PKI secrets engine..."
+        curl -s -X POST "{{.BAO_ADDR}}/v1/sys/mounts/pki" \
+          -H "X-Vault-Token: $ROOT_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d '{"type": "pki"}' > /dev/null
+        
+        # Tune PKI engine for long TTL
+        curl -s -X POST "{{.BAO_ADDR}}/v1/sys/mounts/pki/tune" \
+          -H "X-Vault-Token: $ROOT_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d '{"max_lease_ttl": "{{.ROOT_CA_TTL}}"}' > /dev/null
+        
+        echo "PKI secrets engine enabled"
+
+  generate-root-ca:
+    desc: Generate root CA certificate
+    internal: false
+    cmds:
+      - |
+        if [ ! -f "{{.SECRETS_DIR}}/init.json" ]; then
+          echo "No init.json found. Run 'task initialize' first."
+          exit 1
+        fi
+        
+        ROOT_TOKEN=$(jq -r '.root_token' "{{.SECRETS_DIR}}/init.json")
+        
+        echo "Generating root CA certificate..."
+        RESPONSE=$(curl -s -X POST "{{.BAO_ADDR}}/v1/pki/root/generate/internal" \
+          -H "X-Vault-Token: $ROOT_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "common_name": "{{.ROOT_CA_CN}}",
+            "organization": "{{.ROOT_CA_ORG}}",
+            "ttl": "{{.ROOT_CA_TTL}}",
+            "key_type": "ec",
+            "key_bits": 384
+          }')
+        
+        # Extract and save root certificate
+        echo "$RESPONSE" | jq -r '.data.certificate' > "{{.SECRETS_DIR}}/root-ca.pem"
+        
+        # Configure CRL and issuing URLs
+        curl -s -X POST "{{.BAO_ADDR}}/v1/pki/config/urls" \
+          -H "X-Vault-Token: $ROOT_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "issuing_certificates": "{{.BAO_ADDR}}/v1/pki/ca",
+            "crl_distribution_points": "{{.BAO_ADDR}}/v1/pki/crl"
+          }' > /dev/null
+        
+        echo "Root CA certificate generated and saved to {{.SECRETS_DIR}}/root-ca.pem"
+        echo "Certificate details:"
+        openssl x509 -in "{{.SECRETS_DIR}}/root-ca.pem" -text -noout | head -20
+
+  sign-intermediate:
+    desc: Sign an intermediate CA CSR
+    cmds:
+      - |
+        if [ -z "{{.CSR_FILE}}" ]; then
+          echo "Usage: task sign-intermediate CSR_FILE=path/to/csr.pem"
+          exit 1
+        fi
+        
+        if [ ! -f "{{.CSR_FILE}}" ]; then
+          echo "CSR file not found: {{.CSR_FILE}}"
+          exit 1
+        fi
+        
+        if [ ! -f "{{.SECRETS_DIR}}/init.json" ]; then
+          echo "No init.json found. Run 'task setup-root-ca' first."
+          exit 1
+        fi
+        
+        ROOT_TOKEN=$(jq -r '.root_token' "{{.SECRETS_DIR}}/init.json")
+        CSR_CONTENT=$(cat "{{.CSR_FILE}}")
+        OUTPUT_FILE="${{.CSR_FILE}%.csr}.pem"
+        
+        echo "Signing intermediate CA CSR..."
+        RESPONSE=$(curl -s -X POST "{{.BAO_ADDR}}/v1/pki/root/sign-intermediate" \
+          -H "X-Vault-Token: $ROOT_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"csr\": $(echo "$CSR_CONTENT" | jq -Rs .),
+            \"format\": \"pem_bundle\",
+            \"ttl\": \"43800h\"
+          }")
+        
+        # Check for errors
+        if echo "$RESPONSE" | jq -e '.errors' > /dev/null 2>&1; then
+          echo "Error signing CSR:"
+          echo "$RESPONSE" | jq '.errors'
+          exit 1
+        fi
+        
+        echo "$RESPONSE" | jq -r '.data.certificate' > "$OUTPUT_FILE"
+        echo "Signed certificate saved to: $OUTPUT_FILE"
+    vars:
+      CSR_FILE: '{{.CSR_FILE | default ""}}'
+
+  update-crl:
+    desc: Rotate/update the Certificate Revocation List
+    cmds:
+      - |
+        if [ ! -f "{{.SECRETS_DIR}}/init.json" ]; then
+          echo "No init.json found. Run 'task setup-root-ca' first."
+          exit 1
+        fi
+        
+        ROOT_TOKEN=$(jq -r '.root_token' "{{.SECRETS_DIR}}/init.json")
+        
+        echo "Rotating CRL..."
+        curl -s -X GET "{{.BAO_ADDR}}/v1/pki/crl/rotate" \
+          -H "X-Vault-Token: $ROOT_TOKEN" > /dev/null
+        
+        # Fetch and save current CRL
+        curl -s "{{.BAO_ADDR}}/v1/pki/crl/pem" > "{{.SECRETS_DIR}}/crl.pem"
+        
+        echo "CRL updated and saved to {{.SECRETS_DIR}}/crl.pem"
+
+  encrypt-secrets:
+    desc: Encrypt all secrets with age
+    cmds:
+      - |
+        if [ ! -f "{{.AGE_KEY_FILE}}" ]; then
+          echo "Age key not found. Run 'task init' first."
+          exit 1
+        fi
+        
+        AGE_RECIPIENT=$(grep -oP 'public key: \K.*' "{{.AGE_KEY_FILE}}")
+        mkdir -p "{{.ENCRYPTED_DIR}}"
+        
+        # Encrypt init.json if it exists
+        if [ -f "{{.SECRETS_DIR}}/init.json" ]; then
+          age -r "$AGE_RECIPIENT" -o "{{.ENCRYPTED_DIR}}/init.json.age" "{{.SECRETS_DIR}}/init.json"
+          echo "Encrypted init.json"
+        fi
+        
+        # Encrypt root-ca.pem if it exists
+        if [ -f "{{.SECRETS_DIR}}/root-ca.pem" ]; then
+          age -r "$AGE_RECIPIENT" -o "{{.ENCRYPTED_DIR}}/root-ca.pem.age" "{{.SECRETS_DIR}}/root-ca.pem"
+          echo "Encrypted root-ca.pem"
+        fi
+        
+        # Encrypt CRL if it exists
+        if [ -f "{{.SECRETS_DIR}}/crl.pem" ]; then
+          age -r "$AGE_RECIPIENT" -o "{{.ENCRYPTED_DIR}}/crl.pem.age" "{{.SECRETS_DIR}}/crl.pem"
+          echo "Encrypted crl.pem"
+        fi
+        
+        echo "All secrets encrypted to {{.ENCRYPTED_DIR}}/"
+
+  decrypt-secrets:
+    desc: Decrypt all secrets from age
+    cmds:
+      - |
+        if [ ! -f "{{.AGE_KEY_FILE}}" ]; then
+          echo "Age key not found. Cannot decrypt secrets."
+          exit 1
+        fi
+        
+        mkdir -p "{{.SECRETS_DIR}}"
+        
+        # Decrypt init.json if it exists
+        if [ -f "{{.ENCRYPTED_DIR}}/init.json.age" ]; then
+          age -d -i "{{.AGE_KEY_FILE}}" -o "{{.SECRETS_DIR}}/init.json" "{{.ENCRYPTED_DIR}}/init.json.age"
+          chmod 600 "{{.SECRETS_DIR}}/init.json"
+          echo "Decrypted init.json"
+        fi
+        
+        # Decrypt root-ca.pem if it exists
+        if [ -f "{{.ENCRYPTED_DIR}}/root-ca.pem.age" ]; then
+          age -d -i "{{.AGE_KEY_FILE}}" -o "{{.SECRETS_DIR}}/root-ca.pem" "{{.ENCRYPTED_DIR}}/root-ca.pem.age"
+          echo "Decrypted root-ca.pem"
+        fi
+        
+        # Decrypt CRL if it exists
+        if [ -f "{{.ENCRYPTED_DIR}}/crl.pem.age" ]; then
+          age -d -i "{{.AGE_KEY_FILE}}" -o "{{.SECRETS_DIR}}/crl.pem" "{{.ENCRYPTED_DIR}}/crl.pem.age"
+          echo "Decrypted crl.pem"
+        fi
+        
+        echo "Secrets decrypted to {{.SECRETS_DIR}}/"
+    status:
+      - test -f "{{.SECRETS_DIR}}/init.json"
+
+  clean:
+    desc: Remove all unencrypted secrets and data (DANGEROUS)
+    prompt: This will delete all unencrypted secrets and OpenBao data. Are you sure?
+    cmds:
+      - rm -rf "{{.SECRETS_DIR}}"
+      - rm -rf data/
+      - echo "Cleaned unencrypted secrets and data"
+
+  status:
+    desc: Show OpenBao status
+    cmds:
+      - |
+        echo "OpenBao Status:"
+        curl -s "{{.BAO_ADDR}}/v1/sys/health" | jq . 2>/dev/null || echo "OpenBao is not reachable"

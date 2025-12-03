@@ -1,0 +1,18 @@
+services:
+  openbao:
+    image: quay.io/openbao/openbao:2.1.0
+    container_name: ephemeral-root-ca
+    cap_add:
+      - IPC_LOCK
+    user: root
+    ports:
+      - "8200:8200"
+    volumes:
+      - ./config:/bao/config:ro
+      - ./data:/bao/data
+    environment:
+      - BAO_ADDR=http://127.0.0.1:8200
+      - BAO_API_ADDR=http://127.0.0.1:8200
+      - SKIP_SETCAP=true
+    command: server -config=/bao/config/openbao.hcl
+    restart: unless-stopped

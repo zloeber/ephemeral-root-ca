@@ -1,0 +1,9 @@
+# Encrypted secrets placeholder
+# This directory stores age-encrypted secrets that are safe to commit to git.
+# 
+# Files stored here:
+# - init.json.age: OpenBao initialization data (unseal keys and root token)
+# - root-ca.pem.age: Root CA certificate (encrypted)
+#
+# To decrypt, you need the age.key file which should be stored securely
+# and NEVER committed to git.

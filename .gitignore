@@ -1,0 +1,21 @@
+# Local secrets (unencrypted)
+secrets/
+*.pem
+*.csr
+!*.pem.age
+!*.csr.age
+
+# Age identity key (NEVER commit)
+age.key
+
+# OpenBao data
+data/
+
+# Temporary files
+*.tmp
+*.log
+.task/
+
+# IDE
+.vscode/
+.idea/

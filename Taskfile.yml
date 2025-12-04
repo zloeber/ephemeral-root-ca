@@ -137,8 +137,8 @@ tasks:
 
   run:
     desc: Run OpenBao container
-    deps: [age-init]
     cmds:
+      - task: age-init
       - |
         # Check if OpenBao is already running
         if curl -s "{{.BAO_ADDR}}/v1/sys/health" > /dev/null 2>&1; then
@@ -160,9 +160,11 @@ tasks:
 
   start:
     desc: Decrypt secrets and start OpenBao
-    deps: [age-init, run, decrypt-secrets]
     cmds:
-      - task: unseal
+    - task: age-init
+    - task: run
+    - task: decrypt-secrets
+    - task: unseal
 
   stop:
     desc: Seal OpenBao and encrypt all secrets
@@ -172,12 +174,18 @@ tasks:
       - docker compose down
       - echo "OpenBao stopped and secrets encrypted"
 
-  setup-root-ca:
-    desc: Initialize OpenBao and setup root CA
+  setup-pki:
+    desc: Setup OpenBao with PKI
     cmds:
       - task: initialize
       - task: unseal
       - task: enable-pki
+      - echo "OpenBao and PKI setup complete!"
+
+  setup-root-ca:
+    desc: Initialize OpenBao and setup root CA
+    cmds:
+      - task: setup-pki
       - task: generate-root-ca
       - echo "Root CA setup complete!"
     status:
@@ -874,10 +882,10 @@ tasks:
       - Finally, it will generate the subordinate (issuing) CA.
 
       When completed, you should run the stop task to seal OpenBao and encrypt all secrets for safe keeping.
-    deps: 
-      - start
-      - load-root-ca
-      - setup-root-ca
+    cmds: 
+      - task: start
+      - task: setup-root-ca
+      - task: load-root-ca
       #- generate-sub-ca
 
   show-certs:

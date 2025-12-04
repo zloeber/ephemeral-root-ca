@@ -2,7 +2,7 @@
 # https://taskfile.dev
 
 version: '3'
-
+silent: true
 vars:
   AGE_KEY_FILE: age.key
   SECRETS_DIR: secrets
@@ -38,6 +38,19 @@ vars:
         fi
       fi
       printf "%s" "{{.BAO_ADDR}}"
+  ROOT_CA_CRL_URL:
+    sh: |
+      if [ -f "{{.ROOT_CA_CONFIG_FILE}}" ]; then
+        VALUE=$(jq -r '.crl_base_url // ""' "{{.ROOT_CA_CONFIG_FILE}}")
+        if [ -n "$VALUE" ] && [ "$VALUE" != "null" ]; then
+          case "$VALUE" in
+            http://*|https://*) printf "%s" "$VALUE" ;;
+            *) printf "https://%s" "$VALUE" ;;
+          esac
+          exit 0
+        fi
+      fi
+      printf "%s" "{{.ROOT_CA_BASE_URL}}"
   ROOT_CA_CERT_FILE: "{{.SECRETS_DIR}}/root-ca.pem"
   ROOT_CA_KEY_FILE: "{{.SECRETS_DIR}}/root-ca.key"
   SUB_CA_CONFIG_FILE: config/sub-ca.json
@@ -94,6 +107,7 @@ vars:
   SUB_CA_CERT_FILE: "{{.SECRETS_DIR}}/sub-ca.pem"
   SUB_CA_CERT_BASENAME:
     sh: basename "{{.SUB_CA_CERT_FILE}}"
+  SUB_CA_KEY_FILE: "{{.SECRETS_DIR}}/sub-ca.key"
 
 env:
   BAO_ADDR: "{{.BAO_ADDR}}"
@@ -103,21 +117,6 @@ tasks:
     desc: Show available tasks
     cmds:
       - task --list
-
-  run:
-    desc: Run OpenBao container
-    cmds:
-      - |
-        docker compose up -d
-        echo "Waiting for OpenBao to be ready..."
-        for i in $(seq 1 30); do
-          if curl -s "{{.BAO_ADDR}}/v1/sys/health" > /dev/null 2>&1; then
-            echo "OpenBao is ready"
-            break
-          fi
-          echo "Waiting... ($i/30)"
-          sleep 1
-        done
 
   age-init:
     desc: Generate age encryption key
@@ -136,21 +135,34 @@ tasks:
     status:
       - test -f "{{.AGE_KEY_FILE}}"
 
-  init:
-    desc: Initialize age key and encrypt any existing secrets
-    deps: [age-init, run]
-    # cmds:
-    #   - echo "Initialization complete."
+  run:
+    desc: Run OpenBao container
+    deps: [age-init]
+    cmds:
+      - |
+        # Check if OpenBao is already running
+        if curl -s "{{.BAO_ADDR}}/v1/sys/health" > /dev/null 2>&1; then
+          echo "OpenBao is already running"
+          exit 0
+        fi
+        
+        docker compose up -d
+        sleep 3
+        echo "Waiting for OpenBao to be ready..."
+        for i in $(seq 1 30); do
+          if curl -s "{{.BAO_ADDR}}/v1/sys/health" > /dev/null 2>&1; then
+            echo "OpenBao is ready"
+            break
+          fi
+          echo "Waiting... ($i/30)"
+          sleep 1
+        done
 
   start:
     desc: Decrypt secrets and start OpenBao
-    deps: [decrypt-secrets]
+    deps: [age-init, run, decrypt-secrets]
     cmds:
-      - task: run
       - task: unseal
-    preconditions:
-      - sh: test -f "{{.AGE_KEY_FILE}}"
-        msg: "Age key not found. Run 'task init' first."
 
   stop:
     desc: Seal OpenBao and encrypt all secrets
@@ -292,10 +304,19 @@ tasks:
           -d '{"max_lease_ttl": "{{.ROOT_CA_TTL}}"}' > /dev/null
         
         echo "PKI secrets engine enabled"
+    preconditions:
+      - sh: test -f "{{.SECRETS_DIR}}/init.json"
+        msg: "No init.json found. Run 'task initialize' first."
+    status:
+      - |
+        ROOT_TOKEN=$(jq -r '.root_token' "{{.SECRETS_DIR}}/init.json")
+        MOUNTS=$(curl -s "{{.BAO_ADDR}}/v1/sys/mounts" -H "X-Vault-Token: $ROOT_TOKEN")
+        echo "$MOUNTS" | jq -e '.["pki/"]' > /dev/null 2>&1
 
   generate-root-ca:
     desc: Generate root CA certificate
     internal: false
+    deps: [enable-pki]
     cmds:
       - |
         if [ ! -f "{{.SECRETS_DIR}}/init.json" ]; then
@@ -411,14 +432,17 @@ tasks:
         curl -s -X POST "{{.BAO_ADDR}}/v1/pki/config/urls" \
           -H "X-Vault-Token: $ROOT_TOKEN" \
           -H "Content-Type: application/json" \
-          -d '{
-            "issuing_certificates": "{{.ROOT_CA_BASE_URL}}/v1/pki/ca",
-            "crl_distribution_points": "{{.ROOT_CA_BASE_URL}}/v1/pki/crl"
-          }' > /dev/null
+          -d "$(jq -n \
+            --arg issuing "{{.ROOT_CA_BASE_URL}}/v1/pki/ca" \
+            --arg crl "{{.ROOT_CA_CRL_URL}}/v1/pki/crl" \
+            '{issuing_certificates: $issuing, crl_distribution_points: $crl}')" > /dev/null
         
         echo "Root CA material uploaded and OpenBao URLs configured"
 
         trap - EXIT
+    status:
+      - test -f "{{.ROOT_CA_KEY_FILE}}"
+      - test -f "{{.ROOT_CA_CERT_FILE}}"
 
   load-root-ca:
     desc: Load existing root CA material into OpenBao
@@ -499,12 +523,17 @@ tasks:
         curl -s -X POST "{{.BAO_ADDR}}/v1/pki/config/urls" \
           -H "X-Vault-Token: $ROOT_TOKEN" \
           -H "Content-Type: application/json" \
-          -d '{
-            "issuing_certificates": "{{.ROOT_CA_BASE_URL}}/v1/pki/ca",
-            "crl_distribution_points": "{{.ROOT_CA_BASE_URL}}/v1/pki/crl"
-          }' > /dev/null
+          -d "$(jq -n \
+            --arg issuing "{{.ROOT_CA_BASE_URL}}/v1/pki/ca" \
+            --arg crl "{{.ROOT_CA_CRL_URL}}/v1/pki/crl" \
+            '{issuing_certificates: $issuing, crl_distribution_points: $crl}')" > /dev/null
 
         echo "Root CA configuration synchronized."
+    preconditions:
+      - sh: test -f "{{.ROOT_CA_CERT_FILE}}"
+        msg: "Root CA certificate not found. Provide it at {{.ROOT_CA_CERT_FILE}}"
+      - sh: test -f "{{.ROOT_CA_KEY_FILE}}"
+        msg: "Root CA private key not found. Provide it at {{.ROOT_CA_KEY_FILE}}"
 
   generate-sub-ca:
     desc: Generate subordinate/issuing CA signed by the root CA
@@ -589,6 +618,15 @@ tasks:
           exit 1
         fi
 
+        PRIVATE_KEY=$(echo "$CSR_RESPONSE" | jq -r '.data.private_key // empty')
+        PRIVATE_KEY_TYPE=$(echo "$CSR_RESPONSE" | jq -r '.data.private_key_type // "ec"')
+        PRIVATE_KEY_BITS=$(echo "$CSR_RESPONSE" | jq -r '.data.private_key_bits // empty')
+
+        if [ -z "$PRIVATE_KEY" ]; then
+          echo "No private key returned in CSR generation response."
+          exit 1
+        fi
+
         echo "Publishing signed certificate to $MOUNT..."
         curl -s -X POST "{{.BAO_ADDR}}/v1/$MOUNT/intermediate/set-signed" \
           -H "X-Vault-Token: $ROOT_TOKEN" \
@@ -604,9 +642,20 @@ tasks:
           fi
         } > "{{.SUB_CA_CERT_FILE}}"
 
+        printf '%s\n' "$PRIVATE_KEY" > "{{.SUB_CA_KEY_FILE}}"
+        chmod 600 "{{.SUB_CA_KEY_FILE}}"
+
+        if [ -n "$PRIVATE_KEY_BITS" ] && [ "$PRIVATE_KEY_BITS" != "null" ]; then
+          echo "Subordinate key type: $PRIVATE_KEY_TYPE ($PRIVATE_KEY_BITS bits)"
+        else
+          echo "Subordinate key type: $PRIVATE_KEY_TYPE"
+        fi
+
         if command -v openssl > /dev/null 2>&1; then
           echo "Subordinate certificate summary:"
           openssl x509 -in "{{.SUB_CA_CERT_FILE}}" -text -noout | head -20
+          echo "Subordinate key fingerprint:"
+          openssl pkey -in "{{.SUB_CA_KEY_FILE}}" -pubout -outform PEM | openssl pkey -pubin -outform DER | openssl dgst -sha256
         fi
 
         echo "Configuring issuing and CRL URLs..."
@@ -620,6 +669,8 @@ tasks:
 
         echo "Subordinate CA certificate saved to {{.SUB_CA_CERT_FILE}}"
         echo "Subordinate CA setup complete."
+    status:
+      - test -f "{{.SUB_CA_CERT_FILE}}"
 
   sign-intermediate:
     desc: Sign an intermediate CA CSR
@@ -727,6 +778,11 @@ tasks:
           age -r "$AGE_RECIPIENT" -o "{{.ENCRYPTED_DIR}}/${BASENAME}.age" "{{.SUB_CA_CERT_FILE}}"
           echo "Encrypted $BASENAME"
         fi
+
+        if [ -f "{{.SUB_CA_KEY_FILE}}" ]; then
+          age -r "$AGE_RECIPIENT" -o "{{.ENCRYPTED_DIR}}/sub-ca.key.age" "{{.SUB_CA_KEY_FILE}}"
+          echo "Encrypted sub-ca.key"
+        fi
         
         echo "All secrets encrypted to {{.ENCRYPTED_DIR}}/"
 
@@ -772,6 +828,12 @@ tasks:
           age -d -i "{{.AGE_KEY_FILE}}" -o "{{.SUB_CA_CERT_FILE}}" "{{.ENCRYPTED_DIR}}/${BASENAME}.age"
           echo "Decrypted $BASENAME"
         fi
+
+        if [ -f "{{.ENCRYPTED_DIR}}/sub-ca.key.age" ]; then
+          age -d -i "{{.AGE_KEY_FILE}}" -o "{{.SUB_CA_KEY_FILE}}" "{{.ENCRYPTED_DIR}}/sub-ca.key.age"
+          chmod 600 "{{.SUB_CA_KEY_FILE}}"
+          echo "Decrypted sub-ca.key"
+        fi
         
         echo "Secrets decrypted to {{.SECRETS_DIR}}/"
     status:
@@ -801,3 +863,50 @@ tasks:
       - |
         echo "OpenBao Status:"
         curl -s "{{.BAO_ADDR}}/v1/sys/health" | jq . 2>/dev/null || echo "OpenBao is not reachable"
+
+  all:
+    desc: "Run full setup: init, start, setup-root-ca, generate-sub-ca"
+    summary: |
+      This task is meant to be run from any stage of the setup process. 
+      - If the age encrypted secrets are not yet decrypted, it will decrypt them.
+      - If they are decrypted but OpenBao is not initialized, it will initialize it.
+      - If OpenBao is initialized but the root CA is not set up, it will set it up.
+      - Finally, it will generate the subordinate (issuing) CA.
+
+      When completed, you should run the stop task to seal OpenBao and encrypt all secrets for safe keeping.
+    deps: 
+      - start
+      - load-root-ca
+      - setup-root-ca
+      #- generate-sub-ca
+
+  show-certs:
+    desc: Show certificate information for all PEM files in secrets directory
+    silent: true
+    cmds:
+      - |
+        if ! command -v openssl > /dev/null 2>&1; then
+          echo "OpenSSL is required to display certificate information."
+          exit 1
+        fi
+        
+        if [ ! -d "{{.SECRETS_DIR}}" ]; then
+          echo "Secrets directory not found: {{.SECRETS_DIR}}"
+          exit 1
+        fi
+        
+        FOUND=0
+        for cert_file in "{{.SECRETS_DIR}}"/*.pem; do
+          if [ -f "$cert_file" ]; then
+            FOUND=1
+            echo "═══════════════════════════════════════════════════════════════"
+            echo "Certificate: $(basename "$cert_file")"
+            echo "═══════════════════════════════════════════════════════════════"
+            openssl x509 -in "$cert_file" -text -noout 2>/dev/null || echo "Not a valid certificate file"
+            echo ""
+          fi
+        done
+        
+        if [ $FOUND -eq 0 ]; then
+          echo "No PEM files found in {{.SECRETS_DIR}}"
+        fi

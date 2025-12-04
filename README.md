@@ -97,6 +97,8 @@ Enter `task` to see all tasks available.
 │   ├── init.json         # Unseal keys and root token
 │   ├── root-ca.pem       # Root CA certificate
 │   ├── root-ca.key       # Root CA private key (encrypt before committing!)
+│   ├── sub-ca.pem        # Subordinate CA certificate chain
+│   ├── sub-ca.key        # Subordinate CA private key (encrypt before committing!)
 │   └── crl.pem           # Certificate Revocation List
 ├── data/                 # OpenBao persistent data (gitignored)
 └── age.key               # Age private key (gitignored, BACK THIS UP!)
@@ -140,13 +142,15 @@ Edit `config/root-ca.json` to declare the Root CA metadata:
 {
   "name": "Ephemeral Root CA",
   "organization": "Ephemeral PKI",
-  "domain": "pki.example.com"
+  "domain": "pki.example.com",
+  "crl_base_url": "https://crl.example.com"
 }
 ```
 
 - `name` sets the Root CA common name used during generation.
 - `organization` is optional and defaults to `Ephemeral PKI` when omitted.
-- `domain` is optional; when provided it is used to build the issuing and CRL URLs. Supply either a hostname (scheme defaults to `https://`) or a full URL. When left empty the local `BAO_ADDR` value is used instead.
+- `domain` is optional; when provided it is used to build default issuing and CRL URLs. Supply either a hostname (scheme defaults to `https://`) or a full URL. When left empty the local `BAO_ADDR` value is used instead.
+- `crl_base_url` is optional; use it when you want CRLs served from a different host/base path than the issuing certificate endpoint.
 - When `task setup-root-ca` runs, it first creates a local private key (`secrets/root-ca.key`) and self-signed certificate bundle (`secrets/root-ca.pem`), then uploads both to OpenBao. Keep the key encrypted with `task stop`/`task encrypt-secrets` before committing.
 
 ### Subordinate CA Settings
@@ -168,6 +172,7 @@ Edit `config/sub-ca.json` to describe the issuing CA that will be signed by the 
 - `mount` specifies the OpenBao mount where the subordinate PKI engine lives (defaults to `pki_int`).
 
 Once configured, run `task generate-sub-ca` (with OpenBao unsealed) to provision or refresh the issuing CA. The signed certificate is stored at `secrets/sub-ca.pem` and will be encrypted alongside the other secrets when you run `task stop` or `task encrypt-secrets`.
+The subordinate private key is written to `secrets/sub-ca.key` and encrypted to `encrypted/sub-ca.key.age` during `task stop`.
 
 ### OpenBao Settings
 Edit `config/openbao.hcl` for OpenBao server configuration.

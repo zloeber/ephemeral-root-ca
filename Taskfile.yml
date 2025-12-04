@@ -220,8 +220,8 @@ tasks:
         chmod 600 "{{.SECRETS_DIR}}/init.json"
         
         echo "OpenBao initialized. Unseal key and root token saved to {{.SECRETS_DIR}}/init.json"
-    status:
-      - test -f "{{.SECRETS_DIR}}/init.json"
+    # status:
+    #   - test -f "{{.SECRETS_DIR}}/init.json"
 
   unseal:
     desc: Unseal OpenBao
@@ -892,6 +892,7 @@ tasks:
       When completed, you should run the stop task to seal OpenBao and encrypt all secrets for safe keeping.
     cmds: 
       - task: start
+      - task: decrypt-secrets
       - task: setup-pki
       - task: setup-root-ca
       - task: load-root-ca
@@ -927,3 +928,21 @@ tasks:
         if [ $FOUND -eq 0 ]; then
           echo "No PEM files found in {{.SECRETS_DIR}}"
         fi
+  
+  root:token:
+    desc: Show the root token for OpenBao
+    cmds:
+      - |
+        if [ ! -f "{{.SECRETS_DIR}}/init.json" ]; then
+          echo "No init.json found. Run 'task setup-root-ca' first."
+          exit 1
+        fi
+        
+        ROOT_TOKEN=$(jq -r '.root_token' "{{.SECRETS_DIR}}/init.json")
+        if [ -z "$ROOT_TOKEN" ] || [ "$ROOT_TOKEN" = "null" ]; then
+          echo "Failed to retrieve root token from {{.SECRETS_DIR}}/init.json"
+          exit 1
+        fi
+        
+        echo "OpenBao Root Token:"
+        echo "$ROOT_TOKEN"

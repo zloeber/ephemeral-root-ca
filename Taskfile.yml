@@ -164,7 +164,7 @@ tasks:
     - task: age-init
     - task: run
     - task: decrypt-secrets
-    - task: unseal
+
 
   stop:
     desc: Seal OpenBao and encrypt all secrets
@@ -584,8 +584,8 @@ tasks:
           -H "Content-Type: application/json" \
           -d "$(jq -n --arg ttl "{{.SUB_CA_TTL}}" '{max_lease_ttl: $ttl}')" > /dev/null
 
-        echo "Generating intermediate CSR..."
-        CSR_RESPONSE=$(curl -s -X POST "{{.BAO_ADDR}}/v1/$MOUNT/intermediate/generate/internal" \
+        echo "Generating intermediate CSR and private key..."
+        CSR_RESPONSE=$(curl -s -X POST "{{.BAO_ADDR}}/v1/$MOUNT/intermediate/generate/exported" \
           -H "X-Vault-Token: $ROOT_TOKEN" \
           -H "Content-Type: application/json" \
           -d "$(jq -n \
@@ -629,10 +629,16 @@ tasks:
         PRIVATE_KEY=$(echo "$CSR_RESPONSE" | jq -r '.data.private_key // empty')
         PRIVATE_KEY_TYPE=$(echo "$CSR_RESPONSE" | jq -r '.data.private_key_type // "ec"')
         PRIVATE_KEY_BITS=$(echo "$CSR_RESPONSE" | jq -r '.data.private_key_bits // empty')
+        WRITE_KEY=1
 
         if [ -z "$PRIVATE_KEY" ]; then
-          echo "No private key returned in CSR generation response."
-          exit 1
+          if [ -f "{{.SUB_CA_KEY_FILE}}" ]; then
+            echo "CSR generation did not return a private key; reusing existing {{.SUB_CA_KEY_FILE}}"
+            WRITE_KEY=0
+          else
+            echo "No private key returned in CSR generation response."
+            exit 1
+          fi
         fi
 
         echo "Publishing signed certificate to $MOUNT..."
@@ -650,12 +656,14 @@ tasks:
           fi
         } > "{{.SUB_CA_CERT_FILE}}"
 
-        printf '%s\n' "$PRIVATE_KEY" > "{{.SUB_CA_KEY_FILE}}"
-        chmod 600 "{{.SUB_CA_KEY_FILE}}"
+        if [ "$WRITE_KEY" -eq 1 ]; then
+          printf '%s\n' "$PRIVATE_KEY" > "{{.SUB_CA_KEY_FILE}}"
+          chmod 600 "{{.SUB_CA_KEY_FILE}}"
+        fi
 
-        if [ -n "$PRIVATE_KEY_BITS" ] && [ "$PRIVATE_KEY_BITS" != "null" ]; then
+        if [ -n "$PRIVATE_KEY" ] && [ "$PRIVATE_KEY_BITS" != "null" ] && [ -n "$PRIVATE_KEY_BITS" ]; then
           echo "Subordinate key type: $PRIVATE_KEY_TYPE ($PRIVATE_KEY_BITS bits)"
-        else
+        elif [ -n "$PRIVATE_KEY" ]; then
           echo "Subordinate key type: $PRIVATE_KEY_TYPE"
         fi
 
@@ -884,6 +892,7 @@ tasks:
       When completed, you should run the stop task to seal OpenBao and encrypt all secrets for safe keeping.
     cmds: 
       - task: start
+      - task: setup-pki
       - task: setup-root-ca
       - task: load-root-ca
       #- generate-sub-ca

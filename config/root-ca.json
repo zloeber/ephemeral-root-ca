@@ -1,5 +1,5 @@
 {
-  "name": "Ephemeral Root CA",
-  "organization": "Example",
-  "domain": "example.com"
+  "name": "SRAM Internal Root CA",
+  "organization": "SRAM",
+  "domain": "sram.com"
 }

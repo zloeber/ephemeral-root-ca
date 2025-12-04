@@ -1,7 +1,7 @@
 {
-  "name": "Issuing CA",
-  "organization": "Internal Issuing",
-  "domain": "internal.example.com",
+  "name": "SRAM Internal Issuing CA",
+  "organization": "SRAM",
+  "domain": "internal.sram.com",
   "ttl": "43800h",
   "mount": "pki_int"
 }

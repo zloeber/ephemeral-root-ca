@@ -190,9 +190,9 @@ tasks:
       - echo "Root CA setup complete!"
     status:
       - test -f "{{.ROOT_CA_KEY_FILE}}"
-      - test -f "{{.ENCRYPTED_DIR}}/init.json.age"
-      - test -f "{{.ENCRYPTED_DIR}}/root-ca.pem.age"
-      - test -f "{{.ENCRYPTED_DIR}}/root-ca.key.age"
+      # - test -f "{{.ENCRYPTED_DIR}}/init.json.age"
+      # - test -f "{{.ENCRYPTED_DIR}}/root-ca.pem.age"
+      # - test -f "{{.ENCRYPTED_DIR}}/root-ca.key.age"
 
   # Internal tasks for setup-root-ca
   initialize:
@@ -892,7 +892,6 @@ tasks:
       When completed, you should run the stop task to seal OpenBao and encrypt all secrets for safe keeping.
     cmds: 
       - task: start
-      - task: decrypt-secrets
       - task: setup-pki
       - task: setup-root-ca
       - task: load-root-ca

@@ -38,6 +38,8 @@ vars:
         fi
       fi
       printf "%s" "{{.BAO_ADDR}}"
+  ROOT_CA_CERT_FILE: "{{.SECRETS_DIR}}/root-ca.pem"
+  ROOT_CA_KEY_FILE: "{{.SECRETS_DIR}}/root-ca.key"
   SUB_CA_CONFIG_FILE: config/sub-ca.json
   SUB_CA_MOUNT:
     sh: |
@@ -102,7 +104,22 @@ tasks:
     cmds:
       - task --list
 
-  init:
+  run:
+    desc: Run OpenBao container
+    cmds:
+      - |
+        docker compose up -d
+        echo "Waiting for OpenBao to be ready..."
+        for i in $(seq 1 30); do
+          if curl -s "{{.BAO_ADDR}}/v1/sys/health" > /dev/null 2>&1; then
+            echo "OpenBao is ready"
+            break
+          fi
+          echo "Waiting... ($i/30)"
+          sleep 1
+        done
+
+  age-init:
     desc: Generate age encryption key
     cmds:
       - |
@@ -119,21 +136,17 @@ tasks:
     status:
       - test -f "{{.AGE_KEY_FILE}}"
 
+  init:
+    desc: Initialize age key and encrypt any existing secrets
+    deps: [age-init, run]
+    # cmds:
+    #   - echo "Initialization complete."
+
   start:
     desc: Decrypt secrets and start OpenBao
     deps: [decrypt-secrets]
     cmds:
-      - docker compose up -d
-      - echo "Waiting for OpenBao to be ready..."
-      - |
-        for i in $(seq 1 30); do
-          if curl -s "{{.BAO_ADDR}}/v1/sys/health" > /dev/null 2>&1; then
-            echo "OpenBao is ready"
-            break
-          fi
-          echo "Waiting... ($i/30)"
-          sleep 1
-        done
+      - task: run
       - task: unseal
     preconditions:
       - sh: test -f "{{.AGE_KEY_FILE}}"
@@ -155,6 +168,11 @@ tasks:
       - task: enable-pki
       - task: generate-root-ca
       - echo "Root CA setup complete!"
+    status:
+      - test -f "{{.ROOT_CA_KEY_FILE}}"
+      - test -f "{{.ENCRYPTED_DIR}}/init.json.age"
+      - test -f "{{.ENCRYPTED_DIR}}/root-ca.pem.age"
+      - test -f "{{.ENCRYPTED_DIR}}/root-ca.key.age"
 
   # Internal tasks for setup-root-ca
   initialize:
@@ -285,23 +303,110 @@ tasks:
           exit 1
         fi
         
+        if ! command -v openssl > /dev/null 2>&1; then
+          echo "OpenSSL is required to generate the root CA material."
+          exit 1
+        fi
+
+        mkdir -p "{{.SECRETS_DIR}}"
+
         ROOT_TOKEN=$(jq -r '.root_token' "{{.SECRETS_DIR}}/init.json")
-        
-        echo "Generating root CA certificate..."
-        RESPONSE=$(curl -s -X POST "{{.BAO_ADDR}}/v1/pki/root/generate/internal" \
+        KEY_FILE="{{.ROOT_CA_KEY_FILE}}"
+        CERT_FILE="{{.ROOT_CA_CERT_FILE}}"
+        TTL_INPUT="{{.ROOT_CA_TTL}}"
+        TMP_CFG=""
+        BUNDLE_FILE=""
+
+        cleanup() {
+          if [ -n "$TMP_CFG" ] && [ -f "$TMP_CFG" ]; then rm -f "$TMP_CFG"; fi
+          if [ -n "$BUNDLE_FILE" ] && [ -f "$BUNDLE_FILE" ]; then rm -f "$BUNDLE_FILE"; fi
+        }
+        trap cleanup EXIT
+
+        DAYS=3650
+        if echo "$TTL_INPUT" | grep -Eq '^[0-9]+h$'; then
+          HOURS=${TTL_INPUT%h}
+          if [ "$HOURS" -le 0 ]; then
+            DAYS=1
+          else
+            DAYS=$(( (HOURS + 23) / 24 ))
+          fi
+        elif echo "$TTL_INPUT" | grep -Eq '^[0-9]+d$'; then
+          DAYS=${TTL_INPUT%d}
+        elif echo "$TTL_INPUT" | grep -Eq '^[0-9]+$'; then
+          HOURS=$TTL_INPUT
+          DAYS=$(( (HOURS + 23) / 24 ))
+        fi
+
+        if [ ! -f "$KEY_FILE" ]; then
+          echo "Generating root CA private key at $KEY_FILE"
+          openssl ecparam -name secp384r1 -genkey -noout -out "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+        else
+          echo "Existing root CA private key found at $KEY_FILE"
+        fi
+
+        if [ ! -f "$CERT_FILE" ]; then
+          echo "Creating self-signed root CA certificate at $CERT_FILE"
+          TMP_CFG=$(mktemp)
+          {
+            echo "[ req ]"
+            echo "distinguished_name = dn"
+            echo "x509_extensions = v3_ca"
+            echo "prompt = no"
+            echo "default_md = sha384"
+            echo
+            echo "[ dn ]"
+            echo "CN = {{.ROOT_CA_CN}}"
+            if [ -n "{{.ROOT_CA_ORG}}" ]; then
+              echo "O = {{.ROOT_CA_ORG}}"
+            fi
+            echo
+            echo "[ v3_ca ]"
+            echo "subjectKeyIdentifier = hash"
+            echo "authorityKeyIdentifier = keyid:always,issuer"
+            echo "basicConstraints = critical, CA:true"
+            echo "keyUsage = critical, digitalSignature, cRLSign, keyCertSign"
+          } > "$TMP_CFG"
+
+          if ! openssl req -x509 -new -key "$KEY_FILE" -out "$CERT_FILE" \
+            -days "$DAYS" -config "$TMP_CFG" -extensions v3_ca; then
+            echo "Failed to generate root CA certificate"
+            exit 1
+          fi
+
+          rm -f "$TMP_CFG"
+          TMP_CFG=""
+        else
+          echo "Existing root CA certificate found at $CERT_FILE"
+        fi
+
+        BUNDLE_FILE=$(mktemp)
+        cat "$CERT_FILE" "$KEY_FILE" > "$BUNDLE_FILE"
+
+        echo "Uploading root CA material to OpenBao..."
+        PAYLOAD=$(jq -Rs '{pem_bundle: .}' "$BUNDLE_FILE")
+        HTTP_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "{{.BAO_ADDR}}/v1/pki/config/ca" \
+          -X POST \
           -H "X-Vault-Token: $ROOT_TOKEN" \
           -H "Content-Type: application/json" \
-          -d '{
-            "common_name": "{{.ROOT_CA_CN}}",
-            "organization": "{{.ROOT_CA_ORG}}",
-            "ttl": "{{.ROOT_CA_TTL}}",
-            "key_type": "ec",
-            "key_bits": 384
-          }')
-        
-        # Extract and save root certificate
-        echo "$RESPONSE" | jq -r '.data.certificate' > "{{.SECRETS_DIR}}/root-ca.pem"
-        
+          -d "$PAYLOAD")
+
+        if [ "${HTTP_STATUS#0}" -lt 200 ] || [ "${HTTP_STATUS#0}" -ge 300 ]; then
+          echo "Failed to upload root CA bundle (HTTP $HTTP_STATUS)"
+          exit 1
+        fi
+
+        rm -f "$BUNDLE_FILE"
+        BUNDLE_FILE=""
+
+        if command -v openssl > /dev/null 2>&1; then
+          echo "Root certificate summary:"
+          openssl x509 -in "$CERT_FILE" -text -noout | head -20
+        fi
+
+        echo "Root CA certificate and key stored at $CERT_FILE / $KEY_FILE"
+
         # Configure CRL and issuing URLs
         curl -s -X POST "{{.BAO_ADDR}}/v1/pki/config/urls" \
           -H "X-Vault-Token: $ROOT_TOKEN" \
@@ -311,9 +416,95 @@ tasks:
             "crl_distribution_points": "{{.ROOT_CA_BASE_URL}}/v1/pki/crl"
           }' > /dev/null
         
-        echo "Root CA certificate generated and saved to {{.SECRETS_DIR}}/root-ca.pem"
-        echo "Certificate details:"
-        openssl x509 -in "{{.SECRETS_DIR}}/root-ca.pem" -text -noout | head -20
+        echo "Root CA material uploaded and OpenBao URLs configured"
+
+        trap - EXIT
+
+  load-root-ca:
+    desc: Load existing root CA material into OpenBao
+    cmds:
+      - task: run
+      - task: unseal
+      - task: enable-pki
+      - |
+        if [ ! -f "{{.SECRETS_DIR}}/init.json" ]; then
+          echo "No init.json found. Run 'task initialize' first."
+          exit 1
+        fi
+
+        if [ ! -f "{{.ROOT_CA_CERT_FILE}}" ]; then
+          echo "Root CA certificate not found at {{.ROOT_CA_CERT_FILE}}"
+          exit 1
+        fi
+
+        if [ ! -f "{{.ROOT_CA_KEY_FILE}}" ]; then
+          echo "Root CA private key not found at {{.ROOT_CA_KEY_FILE}}"
+          exit 1
+        fi
+
+        if ! command -v openssl > /dev/null 2>&1; then
+          echo "OpenSSL is required to load the root CA."
+          exit 1
+        fi
+
+        ROOT_TOKEN=$(jq -r '.root_token' "{{.SECRETS_DIR}}/init.json")
+        if [ -z "$ROOT_TOKEN" ] || [ "$ROOT_TOKEN" = "null" ]; then
+          echo "Failed to retrieve root token from {{.SECRETS_DIR}}/init.json"
+          exit 1
+        fi
+
+        LOCAL_FP=$(openssl x509 -in "{{.ROOT_CA_CERT_FILE}}" -noout -fingerprint -sha256 2>/dev/null)
+        if [ -z "$LOCAL_FP" ]; then
+          echo "Unable to compute fingerprint for {{.ROOT_CA_CERT_FILE}}"
+          exit 1
+        fi
+
+        REMOTE_CERT=$(curl -s "{{.BAO_ADDR}}/v1/pki/cert/ca" -H "X-Vault-Token: $ROOT_TOKEN" | jq -r '.data.certificate // empty')
+        REMOTE_FP=""
+        if [ -n "$REMOTE_CERT" ]; then
+          REMOTE_FP=$(printf '%s\n' "$REMOTE_CERT" | openssl x509 -noout -fingerprint -sha256 2>/dev/null || echo "")
+        fi
+
+        if [ -n "$REMOTE_FP" ] && [ "$REMOTE_FP" = "$LOCAL_FP" ]; then
+          echo "Root CA already loaded in OpenBao."
+        else
+          echo "Uploading root CA material to OpenBao..."
+          BUNDLE_FILE=$(mktemp)
+          cleanup_bundle() {
+            if [ -f "$BUNDLE_FILE" ]; then rm -f "$BUNDLE_FILE"; fi
+          }
+          trap cleanup_bundle EXIT
+
+          cat "{{.ROOT_CA_CERT_FILE}}" "{{.ROOT_CA_KEY_FILE}}" > "$BUNDLE_FILE"
+
+          PAYLOAD=$(jq -Rs '{pem_bundle: .}' "$BUNDLE_FILE")
+          HTTP_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "{{.BAO_ADDR}}/v1/pki/config/ca" \
+            -X POST \
+            -H "X-Vault-Token: $ROOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          if [ "${HTTP_STATUS#0}" -lt 200 ] || [ "${HTTP_STATUS#0}" -ge 300 ]; then
+            echo "Failed to upload root CA bundle (HTTP $HTTP_STATUS)"
+            exit 1
+          fi
+
+          cleanup_bundle
+          trap - EXIT
+
+          echo "Root CA bundle uploaded."
+        fi
+
+        echo "Ensuring issuing and CRL URLs are configured..."
+        curl -s -X POST "{{.BAO_ADDR}}/v1/pki/config/urls" \
+          -H "X-Vault-Token: $ROOT_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "issuing_certificates": "{{.ROOT_CA_BASE_URL}}/v1/pki/ca",
+            "crl_distribution_points": "{{.ROOT_CA_BASE_URL}}/v1/pki/crl"
+          }' > /dev/null
+
+        echo "Root CA configuration synchronized."
 
   generate-sub-ca:
     desc: Generate subordinate/issuing CA signed by the root CA
@@ -513,10 +704,16 @@ tasks:
           echo "Encrypted init.json"
         fi
         
-        # Encrypt root-ca.pem if it exists
-        if [ -f "{{.SECRETS_DIR}}/root-ca.pem" ]; then
-          age -r "$AGE_RECIPIENT" -o "{{.ENCRYPTED_DIR}}/root-ca.pem.age" "{{.SECRETS_DIR}}/root-ca.pem"
-          echo "Encrypted root-ca.pem"
+        # Encrypt root-ca certificate bundle if it exists
+        if [ -f "{{.ROOT_CA_CERT_FILE}}" ]; then
+          age -r "$AGE_RECIPIENT" -o "{{.ENCRYPTED_DIR}}/root-ca.pem.age" "{{.ROOT_CA_CERT_FILE}}"
+          echo "Encrypted $(basename "{{.ROOT_CA_CERT_FILE}}")"
+        fi
+
+        # Encrypt root-ca private key if it exists
+        if [ -f "{{.ROOT_CA_KEY_FILE}}" ]; then
+          age -r "$AGE_RECIPIENT" -o "{{.ENCRYPTED_DIR}}/root-ca.key.age" "{{.ROOT_CA_KEY_FILE}}"
+          echo "Encrypted $(basename "{{.ROOT_CA_KEY_FILE}}")"
         fi
         
         # Encrypt CRL if it exists
@@ -551,10 +748,17 @@ tasks:
           echo "Decrypted init.json"
         fi
         
-        # Decrypt root-ca.pem if it exists
+        # Decrypt root-ca certificate bundle if it exists
         if [ -f "{{.ENCRYPTED_DIR}}/root-ca.pem.age" ]; then
-          age -d -i "{{.AGE_KEY_FILE}}" -o "{{.SECRETS_DIR}}/root-ca.pem" "{{.ENCRYPTED_DIR}}/root-ca.pem.age"
-          echo "Decrypted root-ca.pem"
+          age -d -i "{{.AGE_KEY_FILE}}" -o "{{.ROOT_CA_CERT_FILE}}" "{{.ENCRYPTED_DIR}}/root-ca.pem.age"
+          echo "Decrypted $(basename "{{.ROOT_CA_CERT_FILE}}")"
+        fi
+
+        # Decrypt root-ca private key if it exists
+        if [ -f "{{.ENCRYPTED_DIR}}/root-ca.key.age" ]; then
+          age -d -i "{{.AGE_KEY_FILE}}" -o "{{.ROOT_CA_KEY_FILE}}" "{{.ENCRYPTED_DIR}}/root-ca.key.age"
+          chmod 600 "{{.ROOT_CA_KEY_FILE}}"
+          echo "Decrypted $(basename "{{.ROOT_CA_KEY_FILE}}")"
         fi
         
         # Decrypt CRL if it exists
@@ -580,6 +784,16 @@ tasks:
       - rm -rf "{{.SECRETS_DIR}}"
       - rm -rf data/
       - echo "Cleaned unencrypted secrets and data"
+  
+  reset:
+    desc: Remove ALL secrets and data, encrypted or otherwise (DANGEROUS)
+    prompt: This will delete all secrets and OpenBao data. Are you sure?
+    cmds:
+      - task: stop
+      - rm -rf "{{.SECRETS_DIR}}"
+      - rm -rf data/
+      - rm -rf "{{.ENCRYPTED_DIR}}/*.age"
+      - echo "Cleaned all secrets and data"
 
   status:
     desc: Show OpenBao status

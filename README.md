@@ -17,11 +17,15 @@ This project provides a portable, self-contained Root CA that can be:
 # Install mise: https://mise.jdx.dev/getting-started.html
 curl https://mise.run | sh
 
+# While in project folder
+mise trust
+
 # Install tools
-mise install
+mise install -y
 ```
 
 ### Option 2: Manual installation
+
 - [Task](https://taskfile.dev/) - Task runner
 - [age](https://github.com/FiloSottile/age) - Modern encryption tool
 - [jq](https://jqlang.github.io/jq/) - JSON processor
@@ -32,6 +36,9 @@ mise install
 ## Quick Start
 
 ### 1. Initialize (first time only)
+
+If you are creating your new (mostly) offline root CA you will need to bring Vault online and create a self-signed certificate. First personalize the root cert by editing the `./config/root-ca.json` (and optionally the `./config/sub-ca.json` if you are playing with creating that for testing) to your liking. Then create your AGE key.
+
 ```bash
 # Generate age encryption key
 task init
@@ -47,6 +54,8 @@ task initialize
 
 # Wait for OpenBao to be ready, then set up the Root CA
 task setup-root-ca
+
+> The setup task generates a local `secrets/root-ca.key` and matching `secrets/root-ca.pem` bundle before uploading them into OpenBao. Always seal/encrypt (`task stop`) before committing changes so the private key stays protected.
 ```
 
 ### 3. Sign an Intermediate CA (when needed)
@@ -60,25 +69,13 @@ task sign-intermediate CSR_FILE=path/to/intermediate.csr
 
 ### 4. Stop and Seal
 ```bash
-# Seal OpenBao and encrypt all secrets
+# Seal OpenBao and encrypt all secrets (ALWAYS do this before git commit!)
 task stop
 ```
 
 ## Available Tasks
 
-| Task | Description |
-|------|-------------|
-| `task init` | Generate age encryption key (first time setup) |
-| `task start` | Decrypt secrets and start OpenBao |
-| `task stop` | Seal OpenBao and encrypt all secrets |
-| `task setup-root-ca` | Initialize OpenBao and generate root CA |
-| `task generate-sub-ca` | Provision a subordinate/issuing CA from `config/sub-ca.json` |
-| `task sign-intermediate CSR_FILE=<path>` | Sign an intermediate CA CSR |
-| `task update-crl` | Update the Certificate Revocation List |
-| `task status` | Show OpenBao status |
-| `task encrypt-secrets` | Manually encrypt secrets |
-| `task decrypt-secrets` | Manually decrypt secrets |
-| `task clean` | Remove all unencrypted secrets (dangerous!) |
+Enter `task` to see all tasks available.
 
 ## Directory Structure
 
@@ -88,14 +85,18 @@ task stop
 ├── docker-compose.yml    # OpenBao container config
 ├── .mise.toml            # Tool versions
 ├── config/
+│   ├── root-ca.json      # Root CA certificate configuration
+│   ├── sub-ca.json       # Sub CA certificate configuration (optional)
 │   └── openbao.hcl       # OpenBao server config
 ├── encrypted/            # Age-encrypted secrets (safe to commit)
 │   ├── init.json.age     # Encrypted unseal keys and root token
 │   ├── root-ca.pem.age   # Encrypted root CA certificate
+│   ├── root-ca.key.age   # Encrypted root CA private key
 │   └── crl.pem.age       # Encrypted CRL
 ├── secrets/              # Decrypted secrets (gitignored)
 │   ├── init.json         # Unseal keys and root token
 │   ├── root-ca.pem       # Root CA certificate
+│   ├── root-ca.key       # Root CA private key (encrypt before committing!)
 │   └── crl.pem           # Certificate Revocation List
 ├── data/                 # OpenBao persistent data (gitignored)
 └── age.key               # Age private key (gitignored, BACK THIS UP!)
@@ -127,6 +128,7 @@ After the initial setup, you can:
 - **Never commit `age.key`** - This file is your encryption key
 - **Backup `age.key` securely** - Without it, you cannot decrypt your secrets
 - **Keep the Root CA offline** - Only bring it online when needed
+- **Treat `secrets/root-ca.key` like crown jewels** - Always run `task stop` (or `task encrypt-secrets`) before pushing so the private key remains encrypted at rest in version control
 - **Use strong passphrases** - Consider age's passphrase feature for extra security
 - **Rotate keys periodically** - Generate new age keys and re-encrypt
 
@@ -145,6 +147,7 @@ Edit `config/root-ca.json` to declare the Root CA metadata:
 - `name` sets the Root CA common name used during generation.
 - `organization` is optional and defaults to `Ephemeral PKI` when omitted.
 - `domain` is optional; when provided it is used to build the issuing and CRL URLs. Supply either a hostname (scheme defaults to `https://`) or a full URL. When left empty the local `BAO_ADDR` value is used instead.
+- When `task setup-root-ca` runs, it first creates a local private key (`secrets/root-ca.key`) and self-signed certificate bundle (`secrets/root-ca.pem`), then uploads both to OpenBao. Keep the key encrypted with `task stop`/`task encrypt-secrets` before committing.
 
 ### Subordinate CA Settings
 Edit `config/sub-ca.json` to describe the issuing CA that will be signed by the root:
@@ -170,6 +173,12 @@ Once configured, run `task generate-sub-ca` (with OpenBao unsealed) to provision
 Edit `config/openbao.hcl` for OpenBao server configuration.
 
 ## Troubleshooting
+
+### Vault UI
+
+Go to http://localhost:8200 and enter in the token found in `secrets/init.json`.
+
+> **Tip** Copy/Assign/Vew the root token `jq -r '.root_token' "./secrets/init.json"`
 
 ### OpenBao won't start
 ```bash
